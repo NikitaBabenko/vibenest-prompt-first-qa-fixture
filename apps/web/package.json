@@ -1,0 +1,17 @@
+{
+  "name": "@vibenest-qa/web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/app.mjs && node --check src/server.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "express": "5.1.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "vibenest-prompt-first-qa-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "npm --workspace @vibenest-qa/web start",
+    "check": "npm run check --workspaces --if-present",
+    "test": "node --test test/*.test.mjs && npm run test --workspaces --if-present"
+  }
+}
