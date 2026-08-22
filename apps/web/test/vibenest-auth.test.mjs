@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import test from "node:test";
 import session from "express-session";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import * as oidc from "openid-client";
 import { createWebApp } from "../src/app.mjs";
 import {
   createOfficialOidcProtocol,
@@ -24,6 +26,9 @@ test("the official adapter requests code flow with S256 PKCE and validates the c
       calls.push(["discovery", issuer.href, clientId, clientSecret]);
       return clientConfiguration;
     },
+    enableNonRepudiationChecks(configuration) {
+      calls.push(["signature-validation", configuration]);
+    },
     randomPKCECodeVerifier: () => "v".repeat(48),
     randomState: () => "s".repeat(32),
     randomNonce: () => "n".repeat(32),
@@ -42,6 +47,10 @@ test("the official adapter requests code flow with S256 PKCE and validates the c
   };
   const settings = readVibeNestAuthSettings(AUTH_CONFIGURATION);
   const protocol = await createOfficialOidcProtocol(settings, library);
+  assert.deepEqual(calls.find(call => call[0] === "signature-validation"), [
+    "signature-validation",
+    clientConfiguration
+  ]);
   const attempt = await protocol.createLoginAttempt();
 
   assert.equal(attempt.url.protocol, "https:");
@@ -76,7 +85,132 @@ test("the official adapter requests code flow with S256 PKCE and validates the c
   });
 });
 
+const CALLBACK_ATTACKS = [
+  {
+    name: "missing state",
+    callbackParameters: () => ({ code: "missing-state" })
+  },
+  {
+    name: "wrong state",
+    callbackParameters: () => ({ code: "wrong-state", state: "attacker-state" })
+  },
+  {
+    name: "missing PKCE",
+    callbackParameters: ({ state }) => ({ code: "missing-pkce", state }),
+    tokenEndpointError: "authorization code had no PKCE challenge"
+  },
+  {
+    name: "wrong PKCE",
+    callbackParameters: ({ state }) => ({ code: "wrong-pkce", state }),
+    tokenEndpointError: "PKCE verifier mismatch"
+  },
+  {
+    name: "missing nonce",
+    callbackParameters: ({ state }) => ({ code: "missing-nonce", state }),
+    claims: ({ issuer, clientId }) => ({ issuer, audience: clientId, nonce: undefined })
+  },
+  {
+    name: "wrong nonce",
+    callbackParameters: ({ state }) => ({ code: "wrong-nonce", state }),
+    claims: ({ issuer, clientId }) => ({ issuer, audience: clientId, nonce: "attacker-nonce" })
+  },
+  {
+    name: "invalid issuer",
+    callbackParameters: ({ state }) => ({ code: "invalid-issuer", state }),
+    claims: ({ clientId, nonce }) => ({ issuer: "https://attacker.invalid/", audience: clientId, nonce })
+  },
+  {
+    name: "invalid audience",
+    callbackParameters: ({ state }) => ({ code: "invalid-audience", state }),
+    claims: ({ issuer, nonce }) => ({ issuer, audience: "attacker-client", nonce })
+  },
+  {
+    name: "invalid signature",
+    callbackParameters: ({ state }) => ({ code: "invalid-signature", state }),
+    claims: ({ issuer, clientId, nonce }) => ({ issuer, audience: clientId, nonce }),
+    attackerSignature: true
+  },
+  {
+    name: "expired ID token",
+    callbackParameters: ({ state }) => ({ code: "expired-token", state }),
+    claims: ({ issuer, clientId, nonce }) => ({ issuer, audience: clientId, nonce, expired: true })
+  }
+];
+
+test("the real OIDC adapter accepts a correctly signed token and regenerates the session", async () => {
+  const protocol = await createAdversarialOidcProtocol({ name: "valid signed token" });
+  const app = await createWebApp(AUTH_CONFIGURATION, {
+    oidcProtocol: protocol,
+    sessionStore: new session.MemoryStore(),
+    secureCookies: false
+  });
+
+  await withServer(app, async origin => {
+    const login = await fetch(`${origin}/auth/vibenest/login`, { redirect: "manual" });
+    const pendingCookie = responseCookie(login);
+    const state = new URL(login.headers.get("location")).searchParams.get("state");
+    const callback = await fetch(`${origin}/auth/vibenest/callback?code=valid-signed&state=${state}`, {
+      redirect: "manual",
+      headers: { cookie: pendingCookie }
+    });
+
+    assert.equal(callback.status, 303);
+    assert.equal(protocol.testProbe.tokenEndpointCalls, 1);
+    const authenticatedCookie = responseCookie(callback);
+    assert.notEqual(authenticatedCookie, pendingCookie);
+    assert.equal((await fetch(`${origin}/protected`, {
+      headers: { cookie: authenticatedCookie }
+    })).status, 200);
+    assert.equal((await fetch(`${origin}/protected`, {
+      headers: { cookie: pendingCookie }
+    })).status, 401);
+  });
+});
+
+for (const attack of CALLBACK_ATTACKS) {
+  test(`the real OIDC adapter rejects ${attack.name}, consumes state, and redacts provider details`, async () => {
+    const protocol = await createAdversarialOidcProtocol(attack);
+    const app = await createWebApp(AUTH_CONFIGURATION, {
+      oidcProtocol: protocol,
+      sessionStore: new session.MemoryStore(),
+      secureCookies: false
+    });
+
+    await withServer(app, async origin => {
+      const login = await fetch(`${origin}/auth/vibenest/login`, { redirect: "manual" });
+      assert.equal(login.status, 303);
+      const cookie = responseCookie(login);
+      const authorizationUrl = new URL(login.headers.get("location"));
+      const callbackParameters = attack.callbackParameters({
+        state: authorizationUrl.searchParams.get("state")
+      });
+      const callbackUrl = new URL(`${origin}/auth/vibenest/callback`);
+      for (const [name, value] of Object.entries(callbackParameters)) callbackUrl.searchParams.set(name, value);
+
+      const rejected = await fetch(callbackUrl, {
+        redirect: "manual",
+        headers: { cookie }
+      });
+      const rejectedBody = await rejected.text();
+      assert.equal(rejected.status, 401);
+      assert.doesNotMatch(
+        rejectedBody,
+        /attacker|audience|issuer|nonce|pkce|signature|token|provider|verifier|challenge|detail/i
+      );
+      assert.equal(protocol.testProbe.tokenEndpointCalls, attack.name.includes("state") ? 0 : 1);
+
+      const replay = await fetch(callbackUrl, {
+        redirect: "manual",
+        headers: { cookie }
+      });
+      assert.equal(replay.status, 400);
+    });
+  });
+}
+
 test("pending login survives an application restart and callback ignores forged proxy origins", async () => {
+  // This proves the express-session Store contract across app instances. The production
+  // connect-pg-simple schema/restart path requires a real PostgreSQL service and is covered in deployment QA.
   const store = new session.MemoryStore();
   const firstProtocol = createTestProtocol();
   const firstApp = await createWebApp(AUTH_CONFIGURATION, {
@@ -122,6 +256,11 @@ test("pending login survives an application restart and callback ignores forged 
     assert.equal(callbackUrl.searchParams.get("code"), "valid");
 
     const authenticatedCookie = responseCookie(callback);
+    assert.notEqual(authenticatedCookie, loginCookie, "successful callback must regenerate the session ID");
+    const oldSession = await fetch(`${origin}/protected`, {
+      headers: { cookie: loginCookie }
+    });
+    assert.equal(oldSession.status, 401);
     const protectedResponse = await fetch(`${origin}/protected`, {
       headers: { cookie: authenticatedCookie }
     });
@@ -279,6 +418,122 @@ function createTestProtocol({ callbackError } = {}) {
   };
 }
 
+async function createAdversarialOidcProtocol(attack) {
+  const issuer = new URL(AUTH_CONFIGURATION.VIBENEST_AUTH_ISSUER);
+  issuer.pathname = "/";
+  const tokenEndpoint = new URL("/connect/token", issuer).href;
+  const jwksEndpoint = new URL("/.well-known/jwks", issuer).href;
+  const signingKeys = await TEST_SIGNING_KEYS;
+  let currentNonce;
+  let tokenEndpointCalls = 0;
+
+  const clientConfiguration = new oidc.Configuration({
+    issuer: issuer.href,
+    authorization_endpoint: new URL("/connect/authorize", issuer).href,
+    token_endpoint: tokenEndpoint,
+    jwks_uri: jwksEndpoint,
+    response_types_supported: ["code"],
+    id_token_signing_alg_values_supported: ["RS256"],
+    code_challenge_methods_supported: ["S256"]
+  }, AUTH_CONFIGURATION.VIBENEST_AUTH_CLIENT_ID, AUTH_CONFIGURATION.VIBENEST_AUTH_CLIENT_SECRET);
+
+  clientConfiguration[oidc.customFetch] = async (input, init) => {
+    const requestUrl = input instanceof URL ? input.href : typeof input === "string" ? input : input.url;
+    if (requestUrl === jwksEndpoint) {
+      return jsonResponse({ keys: [signingKeys.publicJwk] });
+    }
+    if (requestUrl !== tokenEndpoint) throw new Error(`unexpected OIDC request: ${requestUrl}`);
+
+    tokenEndpointCalls += 1;
+    const body = new URLSearchParams(await requestBody(input, init));
+    assert.equal(body.get("redirect_uri"), AUTH_CONFIGURATION.VIBENEST_AUTH_REDIRECT_URI);
+    assert.ok(body.get("code_verifier"), "the real adapter must send its PKCE verifier");
+    if (attack.tokenEndpointError) {
+      return jsonResponse({
+        error: "invalid_grant",
+        error_description: attack.tokenEndpointError
+      }, 400);
+    }
+
+    const claimOverrides = attack.claims?.({
+      issuer: issuer.href,
+      clientId: AUTH_CONFIGURATION.VIBENEST_AUTH_CLIENT_ID,
+      nonce: currentNonce
+    }) ?? {
+      issuer: issuer.href,
+      audience: AUTH_CONFIGURATION.VIBENEST_AUTH_CLIENT_ID,
+      nonce: currentNonce
+    };
+    const privateKey = attack.attackerSignature ? signingKeys.attackerPrivateKey : signingKeys.privateKey;
+    const idToken = await signIdToken(privateKey, claimOverrides);
+    return jsonResponse({
+      access_token: "opaque-access-token-not-returned-to-the-application",
+      token_type: "Bearer",
+      expires_in: 300,
+      id_token: idToken
+    });
+  };
+
+  const protocol = await createOfficialOidcProtocol(readVibeNestAuthSettings(AUTH_CONFIGURATION), {
+    ...oidc,
+    async discovery() {
+      return clientConfiguration;
+    },
+    buildAuthorizationUrl(configuration, parameters) {
+      currentNonce = parameters.nonce;
+      return oidc.buildAuthorizationUrl(configuration, parameters);
+    }
+  });
+  protocol.testProbe = {
+    get tokenEndpointCalls() {
+      return tokenEndpointCalls;
+    }
+  };
+  return protocol;
+}
+
+const TEST_SIGNING_KEYS = createTestSigningKeys();
+
+async function createTestSigningKeys() {
+  const legitimate = await generateKeyPair("RS256");
+  const attacker = await generateKeyPair("RS256");
+  const publicJwk = await exportJWK(legitimate.publicKey);
+  Object.assign(publicJwk, { alg: "RS256", kid: "fixture-signing-key", use: "sig" });
+  return {
+    privateKey: legitimate.privateKey,
+    attackerPrivateKey: attacker.privateKey,
+    publicJwk
+  };
+}
+
+async function signIdToken(privateKey, claims) {
+  const issuedAt = Math.floor(Date.now() / 1000);
+  let token = new SignJWT({
+    sub: "pairwise-subject",
+    ...(claims.nonce === undefined ? {} : { nonce: claims.nonce })
+  })
+    .setProtectedHeader({ alg: "RS256", kid: "fixture-signing-key" })
+    .setIssuer(claims.issuer)
+    .setAudience(claims.audience)
+    .setIssuedAt(issuedAt);
+  token = token.setExpirationTime(claims.expired ? issuedAt - 3_600 : issuedAt + 300);
+  return token.sign(privateKey);
+}
+
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json" }
+  });
+}
+
+async function requestBody(input, init) {
+  if (typeof init?.body === "string") return init.body;
+  if (init?.body instanceof URLSearchParams) return init.body.toString();
+  if (input instanceof Request) return input.clone().text();
+  return "";
+}
+
 async function logoutRequest(origin, cookie, csrfToken, requestOrigin) {
   return fetch(`${origin}/auth/logout`, {
     method: "POST",
@@ -305,6 +560,7 @@ async function withServer(app, work) {
   try {
     await work(`http://127.0.0.1:${address.port}`);
   } finally {
+    server.closeAllConnections();
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await app.locals.closeResources();
   }

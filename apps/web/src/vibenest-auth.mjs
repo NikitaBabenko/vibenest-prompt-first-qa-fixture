@@ -59,6 +59,7 @@ export async function createOfficialOidcProtocol(settings, oidcLibrary = oidc) {
     settings.clientId,
     settings.clientSecret
   );
+  oidcLibrary.enableNonRepudiationChecks(clientConfiguration);
 
   return {
     async createLoginAttempt() {
