@@ -8,10 +8,15 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "check": "node --check src/app.mjs && node --check src/server.mjs",
+    "check": "node --check src/app.mjs && node --check src/server.mjs && node --check src/vibenest-auth.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "express": "5.1.0"
+    "connect-pg-simple": "10.0.0",
+    "csrf-sync": "4.2.1",
+    "express": "5.1.0",
+    "express-session": "1.19.0",
+    "openid-client": "6.8.7",
+    "pg": "8.23.0"
   }
 }

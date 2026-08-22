@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "vibenest-auth-evidence-v1",
+  "framework": "node-express",
+  "authorizationCodePkce": true,
+  "serverSideCallbackValidation": true,
+  "httpOnlyServerSession": true,
+  "logout": true,
+  "protectedRouteTests": true
+}

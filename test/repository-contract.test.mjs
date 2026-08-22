@@ -17,19 +17,32 @@ test("root selects the web workspace and declares two services", async () => {
   );
 });
 
-test("baseline has no container recipe or connected integration artifacts", async () => {
+test("Auth-only integration has no container recipe, payment artifacts, or credentials", async () => {
   const files = await collectFiles(root);
   assert.equal(files.some(file => path.basename(file).toLowerCase() === "dockerfile"), false);
+
+  const evidencePath = path.join(root, ".vibenest", "evidence", "vibenest-auth.json");
+  assert.deepEqual(JSON.parse(await readFile(evidencePath, "utf8")), {
+    schemaVersion: "vibenest-auth-evidence-v1",
+    framework: "node-express",
+    authorizationCodePkce: true,
+    serverSideCallbackValidation: true,
+    httpOnlyServerSession: true,
+    logout: true,
+    protectedRouteTests: true
+  });
+  assert.equal(files.some(file => file.replaceAll("\\", "/").endsWith("/.vibenest/payments.yaml")), false);
 
   const inspected = files.filter(file =>
     file.endsWith("package.json")
     || file.endsWith(".mjs") && !file.endsWith("repository-contract.test.mjs")
   );
   const forbidden = [
-    ["VIBENEST", "AUTH"].join("_"),
     ["VIBENEST", "PROJECT", "PAYMENTS"].join("_"),
     [".vibenest", "payments.yaml"].join("/"),
-    ["vn", "pi_"].join("")
+    ["vn", "pi_"].join(""),
+    ["vn", "pa_"].join(""),
+    ["vn", "pr_"].join("")
   ];
 
   for (const file of inspected) {

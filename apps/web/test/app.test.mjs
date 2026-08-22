@@ -7,7 +7,7 @@ import { APP_MARKER, createWebApp } from "../src/app.mjs";
 import { CRASH_MARKER } from "../src/server.mjs";
 
 test("root and health endpoints expose stable public markers", async () => {
-  await withServer(createWebApp({}), async origin => {
+  await withServer(await createWebApp({}), async origin => {
     const root = await fetch(`${origin}/`);
     assert.equal(root.status, 200);
     assert.match(root.headers.get("content-type"), /^text\/html/);
@@ -27,7 +27,7 @@ test("metadata and topology reveal availability but never configuration values",
     API_INTERNAL_URL: `http://${secretLookingValue}.internal`
   };
 
-  await withServer(createWebApp(configuration), async origin => {
+  await withServer(await createWebApp(configuration), async origin => {
     const metaText = await (await fetch(`${origin}/meta`)).text();
     assert.doesNotMatch(metaText, new RegExp(secretLookingValue));
     const meta = JSON.parse(metaText);
@@ -46,7 +46,7 @@ test("metadata and topology reveal availability but never configuration values",
 });
 
 test("protected and unknown routes fail closed", async () => {
-  await withServer(createWebApp({}), async origin => {
+  await withServer(await createWebApp({}), async origin => {
     assert.equal((await fetch(`${origin}/protected`)).status, 401);
     assert.equal((await fetch(`${origin}/missing`)).status, 404);
   });
@@ -75,5 +75,6 @@ async function withServer(app, work) {
     await work(`http://127.0.0.1:${address.port}`);
   } finally {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await app.locals.closeResources();
   }
 }

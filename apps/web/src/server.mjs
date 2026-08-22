@@ -3,7 +3,7 @@ import { createWebApp } from "./app.mjs";
 
 export const CRASH_MARKER = "QA_FIXTURE_INTENTIONAL_CRASH";
 
-export function startWebServer(configuration = process.env) {
+export async function startWebServer(configuration = process.env) {
   if (configuration.QA_STARTUP_MODE === "crash") {
     process.stderr.write(`${CRASH_MARKER}\n`);
     process.exitCode = 42;
@@ -11,8 +11,15 @@ export function startWebServer(configuration = process.env) {
   }
 
   const port = parsePort(configuration.PORT);
-  const server = createWebApp(configuration).listen(port, "0.0.0.0");
-  const stop = () => server.close(() => process.exit(0));
+  const app = await createWebApp(configuration);
+  const server = app.listen(port, "0.0.0.0");
+  const stop = () => server.close(async () => {
+    try {
+      await app.locals.closeResources();
+    } finally {
+      process.exit(0);
+    }
+  });
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   return server;
@@ -28,5 +35,5 @@ function parsePort(value) {
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
-  startWebServer();
+  await startWebServer();
 }
